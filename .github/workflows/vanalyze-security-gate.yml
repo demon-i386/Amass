@@ -1,0 +1,409 @@
+# ============================================================
+# vanalyze Security Gate - CI/CD Workflow
+# ============================================================
+# Triggers security scans via the vanalyze API and blocks merge/deploy
+# when the org's gate policy is violated (critical/high by default,
+# configurable per org in Settings > Security Gate).
+#
+# This file is a GITHUB ACTIONS WORKFLOW (YAML) — copy it to
+# .github/workflows/. It is NOT a runnable bash script; to exercise the
+# gate locally, use the companion runner:
+#
+#     VANALYZE_API_KEY=... ./gate_local.sh owner/repo
+#
+# SINGLE SOURCE OF TRUTH: this is the canonical gate. The customer-facing copy
+# at .github/workflows/vanalyze-security-gate.yml (the one
+# docs/CICD_INTEGRACAO.md tells customers to copy) MUST stay byte-identical to
+# this file. Edit here and mirror — never the other way around:
+#
+#     cp gate_script.yml .github/workflows/vanalyze-security-gate.yml
+#
+# The triggered scans carry github_run_id, which links the CI batch to the
+# GitHub workflow run so the Pipeline screen merges Job -> Scans -> Gate.
+#
+# Required secrets:
+#   VANALYZE_API_KEY - API key from vanalyze (Settings > API Keys)
+#
+# Optional repo/organization variables:
+#   VANALYZE_API_URL      - Base URL (default: https://api-prod-v1.vanalyze.io)
+#   VANALYZE_SCAN_TYPES  - Comma-separated checks (default: sast,sca,secrets,dependencies)
+#                           TIP: "full" runs every check in one pass
+#   VANALYZE_POLL_INTERVAL - Seconds between gate-check polls (default: 10)
+#   VANALYZE_MAX_ATTEMPTS - Max polls before timeout (default: 90)
+# ============================================================
+
+name: vanalyze Security Gate
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+# Um push novo cancela a execucao anterior do mesmo ref: sem isso, pushes
+# seguidos disparam lotes de scan em paralelo e a fila do gate nunca converge.
+concurrency:
+  group: vanalyze-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    # Teto de tempo: o default do GitHub (6h) deixaria um scan travado preso por
+    # horas; 30min cobre o pior caso com VANALYZE_MAX_ATTEMPTS=90 e intervalo 10s.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run vanalyze Security Gate
+        env:
+          VANALYZE_API_KEY: ${{ secrets.VANALYZE_API_KEY }}
+          VANALYZE_API_URL: ${{ vars.VANALYZE_API_URL || 'https://api-prod-v1.vanalyze.io' }}
+          VANALYZE_SCAN_TYPES: ${{ vars.VANALYZE_SCAN_TYPES || 'sast,sca,secrets,dependencies' }}
+          VANALYZE_POLL_INTERVAL: ${{ vars.VANALYZE_POLL_INTERVAL || '10' }}
+          VANALYZE_MAX_ATTEMPTS: ${{ vars.VANALYZE_MAX_ATTEMPTS || '90' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          API_URL="${VANALYZE_API_URL%/}"
+          AUTH_HEADER="Authorization: Bearer ${VANALYZE_API_KEY}"
+          CONTENT_TYPE="Content-Type: application/json"
+
+          # ── Banner ─────────────────────────────────────────────────
+          # The "V" in purple (35); the calligraphic "analyze" and rules in
+          # gray (90). Grid verified: all lines 28 cols before the frame.
+          printf '\n'
+          printf '\033[90m     _. ._   _. |    _   _  \033[0m\n'
+          printf ' \033[35m\\/\033[90m (_| | | (_| | \033[35m\\/\033[90m /_ (/_ \033[0m\n'
+          printf '\033[90m                  /         \033[0m\n'
+          printf '\033[90m    ────────────────────────────────────────────────────────────\033[0m\n'
+          printf '\033[90m     SECURITY GATE · continuous application security\033[0m\n'
+          printf '\033[90m    ────────────────────────────────────────────────────────────\033[0m\n'
+          printf '\n'
+
+          # Small helpers -------------------------------------------------
+          # All JSON parsing in ONE place: never let a malformed body kill
+          # the pipeline with an opaque python traceback.
+          json_get() {
+            # json_get <file> <python-expr over data>
+            python3 -c "
+          import json, sys
+          try:
+              with open('$1') as f: data = json.load(f)
+          except Exception:
+              sys.exit(1)
+          print(eval('''$2'''))
+          " 2>/dev/null
+          }
+
+          # HTTP POST helper: writes body to <outfile>, echoes HTTP code.
+          api_post() {
+            # api_post <outfile> <endpoint> <json-body>
+            local out="$1" endpoint="$2" body="$3"
+            curl -s -o "${out}.body" -w "%{http_code}" \
+              -X POST \
+              -H "${AUTH_HEADER}" \
+              -H "${CONTENT_TYPE}" \
+              -d "${body}" \
+              "${API_URL}${endpoint}" || echo "000"
+          }
+
+          fail() { printf '\033[31m\033[1m[FAIL]\033[0m %s\n' "$1"; exit 1; }
+
+          # ── Step 0: sanity ─────────────────────────────────────────
+          if [ -z "${VANALYZE_API_KEY}" ]; then
+            fail "VANALYZE_API_KEY secret is not configured. Add it in Settings > Secrets and variables > Actions."
+          fi
+
+          # ── Step 1: Find repository via API key ──────────────────────
+          echo "::group::Step 1 - Find repository"
+          LOOKUP_CODE=$(api_post /tmp/lookup "/api/vanalyze/scans/gate-repo-lookup" "{\"repo\": \"${GITHUB_REPOSITORY}\"}")
+
+          if [ "${LOOKUP_CODE}" != "200" ]; then
+            fail "Repository lookup failed (HTTP ${LOOKUP_CODE}): $(cat /tmp/lookup.body 2>/dev/null | head -c 300)"
+          fi
+          mv /tmp/lookup.body /tmp/lookup.json
+
+          REPO_FOUND=$(json_get /tmp/lookup.json "str(data.get('found', False)).lower()" || echo error)
+          if [ "${REPO_FOUND}" = "error" ]; then
+            fail "Malformed lookup response: $(head -c 300 /tmp/lookup.json)"
+          fi
+          if [ "${REPO_FOUND}" != "true" ]; then
+            fail "$(json_get /tmp/lookup.json "data.get('message', 'Repository not found')")"
+          fi
+
+          REPO_ACTIVE=$(json_get /tmp/lookup.json "str(data.get('is_active', False)).lower()")
+          if [ "${REPO_ACTIVE}" != "true" ]; then
+            fail "Repository '${GITHUB_REPOSITORY}' is disabled in vanalyze. Enable it in Settings > Repositories."
+          fi
+
+          REPO_FULL_NAME=$(json_get /tmp/lookup.json "data.get('full_name', '')")
+          printf '\033[90m[gate]\033[0m repository: \033[1m%s\033[0m\n' "${REPO_FULL_NAME}"
+          echo "::endgroup::"
+
+          # ── Step 2: Trigger scans ────────────────────────────────────
+          echo "::group::Step 2 - Trigger scans"
+          # One payload, built in one place: scan types + github_run_id (linking
+          # the batch to this workflow run; the API stores it in scan.meta and
+          # routers/pipelines.py merges Job -> Scans -> Gate with it).
+          TRIGGER_PAYLOAD=$(REPO_FULL_NAME="${REPO_FULL_NAME}" SCAN_TYPES="${VANALYZE_SCAN_TYPES}" python3 -c "
+          import json, os
+          types = os.environ.get('SCAN_TYPES', 'sast,sca,secrets,dependencies')
+          payload = {
+              'repo': os.environ.get('REPO_FULL_NAME', ''),
+              'scan_types': [t.strip() for t in types.split(',') if t.strip()],
+          }
+          run_id = os.environ.get('GITHUB_RUN_ID', '').strip()
+          if run_id.isdigit():
+              payload['github_run_id'] = int(run_id)
+          print(json.dumps(payload))
+          ")
+
+          TRIGGER_CODE=$(api_post /tmp/trigger "/api/vanalyze/scans/trigger" "${TRIGGER_PAYLOAD}")
+
+          if [ "${TRIGGER_CODE}" != "200" ]; then
+            fail "Scan trigger failed (HTTP ${TRIGGER_CODE}): $(cat /tmp/trigger.body 2>/dev/null | head -c 300)"
+          fi
+          mv /tmp/trigger.body /tmp/trigger.json
+
+          SCAN_IDS=$(json_get /tmp/trigger.json "json.dumps(data.get('scan_ids', []))")
+          SCAN_COUNT=$(json_get /tmp/trigger.json "len(data.get('scan_ids', []))")
+          if [ "${SCAN_COUNT}" = "0" ] || [ -z "${SCAN_IDS}" ]; then
+            fail "No scans were created (check the requested scan_types: ${VANALYZE_SCAN_TYPES})"
+          fi
+          printf '\033[90m[gate]\033[0m triggered %s scan(s): %s\n' "${SCAN_COUNT}" "${SCAN_IDS}"
+          echo "::endgroup::"
+
+          # ── Step 3: Poll gate-check ──────────────────────────────────
+          echo "::group::Step 3 - Poll gate-check"
+          ATTEMPT=0
+          GATE_STATUS="pending"
+          GATE_RESPONSE="{}"
+
+          while [ "${GATE_STATUS}" = "pending" ] && [ "${ATTEMPT}" -lt "${VANALYZE_MAX_ATTEMPTS}" ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            printf '\033[90m[gate]\033[0m poll %s/%s...\n' "${ATTEMPT}" "${VANALYZE_MAX_ATTEMPTS}"
+
+            GATE_CODE=$(api_post /tmp/gate "/api/vanalyze/scans/gate-check" "{\"scan_ids\": ${SCAN_IDS}}")
+
+            if [ "${GATE_CODE}" != "200" ]; then
+              case "${GATE_CODE}" in
+                4*)
+                  # 401/403/404 nao melhoram com espera: chave invalida, sem
+                  # permissao no repositorio ou scan_id inexistente. Falha na
+                  # hora, em vez de gastar 15 min de poll.
+                  fail "gate-check recusou a requisicao (HTTP ${GATE_CODE}): $(cat /tmp/gate.body 2>/dev/null | head -c 300)"
+                  ;;
+              esac
+              # Transient 5xx/timeout: retry instead of dying mid-scan.
+              printf '\033[33m[gate]\033[0m gate-check returned HTTP %s — retrying\n' "${GATE_CODE}"
+              sleep "${VANALYZE_POLL_INTERVAL}"
+              continue
+            fi
+            mv /tmp/gate.body /tmp/gate_response.json
+            GATE_RESPONSE="$(cat /tmp/gate_response.json)"
+
+            GATE_STATUS=$(json_get /tmp/gate_response.json "data.get('gate_status', 'unknown')" || echo unknown)
+
+            if [ "${GATE_STATUS}" = "pending" ]; then
+              printf '\033[90m[gate]\033[0m scans running, waiting %ss...\n' "${VANALYZE_POLL_INTERVAL}"
+              sleep "${VANALYZE_POLL_INTERVAL}"
+            fi
+          done
+          echo "::endgroup::"
+
+          # ── Fail-closed: a scan that did NOT complete is never green ──
+          # The API already returns `failed` for a batch with a failed scan;
+          # this client-side check keeps the verdict honest against an older
+          # API (or a proxy) and mirrors the message in the PR comment.
+          GATE_REASON=""
+          FAILED_SCANS=$(json_get /tmp/gate_response.json "sum(1 for r in data.get('scan_results', []) if r.get('status') == 'failed')" || echo 0)
+          if [ "${GATE_STATUS}" = "passed" ] && [ "${FAILED_SCANS}" != "0" ]; then
+            GATE_STATUS="failed"
+            GATE_REASON="${FAILED_SCANS} scan(s) failed — no coverage for the checks that did not run"
+            printf '\033[31m[gate]\033[0m %s\n' "${GATE_REASON}"
+          fi
+
+          # ── Step 4: Results summary ──────────────────────────────────
+          echo "::group::Step 4 - Results summary"
+          GATE_VERDICT="${GATE_STATUS}" GATE_REASON="${GATE_REASON}" python3 - <<'PYEOF'
+          import json
+          import os
+
+          try:
+              with open("/tmp/gate_response.json") as f:
+                  data = json.load(f)
+          except Exception:
+              data = {"gate_status": "unknown", "reason": "no valid gate response", "scan_results": []}
+
+          gate = os.environ.get("GATE_VERDICT") or data.get("gate_status", "unknown")
+          reason = os.environ.get("GATE_REASON") or data.get("reason") or ""
+          summary = data.get("findings_summary", {})
+          results = data.get("scan_results", [])
+          if any(r.get("status") == "failed" for r in results) and gate == "passed":
+              gate = "failed"   # fail-closed: no coverage is never a green gate
+              reason = reason or "scan(s) failed — no coverage for the checks that did not run"
+
+          V  = "\033[35m"   # purple
+          G  = "\033[90m"   # gray
+          R  = "\033[31m"   # red
+          GRN= "\033[32m"   # green
+          Y  = "\033[33m"   # yellow
+          B  = "\033[1m"    # bold
+          E  = "\033[0m"    # reset
+
+          verdict, color = {
+              "passed":  ("PASSED", GRN),
+              "failed":  ("FAILED", R),
+              "pending": ("TIMEOUT", Y),
+          }.get(gate, ("UNKNOWN", Y))
+
+          print()
+          print(f"{G}    ────────────────────────────────────────────────────────────{E}")
+          print(f"{G}     SECURITY GATE VERDICT:{E} {color}{B}{verdict}{E}")
+          if reason:
+              print(f"{G}     {reason}{E}")
+          for extra in (data.get("blocked_reasons") or []):
+              print(f"{G}       · {extra}{E}")
+          for extra in (data.get("skipped_branches") or []):
+              print(f"{G}       · branch fora do escopo do gate: {extra}{E}")
+          print(f"{G}    ────────────────────────────────────────────────────────────{E}")
+
+          c, h = summary.get("critical", 0), summary.get("high", 0)
+          m, l = summary.get("medium", 0), summary.get("low", 0)
+          print(f"\n{B}     Findings Summary{E}")
+          print(f"       {R}Critical: {c}{E}")
+          print(f"       {Y}High:     {h}{E}")
+          print(f"       {G}Medium:   {m}{E}")
+          print(f"       {G}Low:      {l}{E}")
+
+          if results:
+              print(f"\n{B}     Scan Results{E}")
+              for r in results:
+                  f = r.get("findings", {})
+                  st = r.get("status", "?")
+                  st_color = {"completed": GRN, "failed": R, "running": Y, "queued": Y}.get(st, G)
+                  print(f"       [{st_color}{st:>10}{E}] {G}{r.get('type','?'):>14}{E} — {r.get('repo','')}  "
+                        f"(C:{f.get('critical',0)} H:{f.get('high',0)} M:{f.get('medium',0)} L:{f.get('low',0)})")
+
+          print(f"\n{G}    ────────────────────────────────────────────────────────────{E}\n")
+          PYEOF
+          echo "::endgroup::"
+
+          # ── Step 5: Post/refresh PR comment (if pull request) ───────
+          if [ -n "${PR_NUMBER}" ] && [ "${PR_NUMBER}" != "" ]; then
+            echo "::group::Step 5 - Post PR comment"
+
+            COMMENT_BODY=$(GATE_VERDICT="${GATE_STATUS}" GATE_REASON="${GATE_REASON}" python3 - <<'PYEOF'
+          import json
+          import os
+
+          try:
+              with open("/tmp/gate_response.json") as f:
+                  data = json.load(f)
+          except Exception:
+              data = {"gate_status": "unknown", "reason": "no valid gate response", "scan_results": []}
+
+          gate = os.environ.get("GATE_VERDICT") or data.get("gate_status", "unknown")
+          reason = os.environ.get("GATE_REASON") or data.get("reason") or ""
+          summary = data.get("findings_summary", {})
+          results = data.get("scan_results", [])
+          failed = [r for r in results if r.get("status") == "failed"]
+          if failed and gate == "passed":
+              gate = "failed"   # fail-closed: no coverage is never a green gate
+              reason = reason or "scan(s) failed — no coverage for the checks that did not run"
+
+          icon = {"passed": "✅", "failed": "❌", "pending": "⏳"}.get(gate, "❓")
+
+          lines = []
+          lines.append(f"## {icon} vanalyze Security Gate: **{gate.upper()}**")
+          if reason:
+              lines.append(f"> {reason}")
+          for extra in (data.get("blocked_reasons") or []):
+              lines.append(f"> - {extra}")
+          for extra in (data.get("skipped_branches") or []):
+              lines.append(f"> - branch fora do escopo do gate: `{extra}`")
+          if failed:
+              # A scan that did not complete is a BLOCK, never a green tick with
+              # a small red cell in the table: there is no coverage for it.
+              checks = ", ".join(sorted({r.get("type", "?") for r in failed}))
+              lines.append("")
+              lines.append(
+                  f"> ⚠️ **{len(failed)} scan(s) did not complete** ({checks}): "
+                  "no coverage for those checks — the gate is not green."
+              )
+          lines.append("")
+          lines.append("### Findings Summary")
+          lines.append("| Severity | Count |")
+          lines.append("|----------|-------|")
+          lines.append(f"| 🔴 Critical | {summary.get('critical', 0)} |")
+          lines.append(f"| 🟠 High | {summary.get('high', 0)} |")
+          lines.append(f"| 🟡 Medium | {summary.get('medium', 0)} |")
+          lines.append(f"| 🟢 Low | {summary.get('low', 0)} |")
+          lines.append("")
+
+          if results:
+              lines.append("### Scan Details")
+              lines.append("| Check | Status | Critical | High | Medium | Low |")
+              lines.append("|-------|--------|----------|------|--------|-----|")
+              for r in results:
+                  f = r.get("findings", {})
+                  st = r.get("status", "?")
+                  st_icon = {"completed": "✅", "failed": "❌", "running": "⏳", "queued": "⏳"}.get(st, "❓")
+                  lines.append(f"| {r.get('type','?')} | {st_icon} {st} | {f.get('critical', 0)} | {f.get('high', 0)} | {f.get('medium', 0)} | {f.get('low', 0)} |")
+
+          lines.append("")
+          lines.append("---")
+          lines.append("*Continuous application security — powered by vanalyze*")
+          print("\n".join(lines))
+          PYEOF
+            )
+
+            # Refresh (edit) the gate comment on re-runs instead of spamming
+            # a new comment on every push to the same PR: find our marker,
+            # update if present, create otherwise.
+            COMMENT_FILE=/tmp/gate_comment.md
+            printf '%s\n' "${COMMENT_BODY}" > "${COMMENT_FILE}"
+            MARKER="vanalyze Security Gate"
+
+            EXISTING_ID=$(gh pr view "${PR_NUMBER}" --json comments --jq \
+              ".comments | map(select(.body | contains(\"${MARKER}\"))) | last | .id // 0" 2>/dev/null || echo 0)
+
+            if [ "${EXISTING_ID}" != "0" ] && [ -n "${EXISTING_ID}" ]; then
+              gh api --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_ID}" \
+                -F body=@"${COMMENT_FILE}" >/dev/null 2>&1 \
+                || gh pr comment "${PR_NUMBER}" --body-file "${COMMENT_FILE}" 2>/dev/null \
+                || echo "::warning::Could not update PR comment"
+            else
+              gh pr comment "${PR_NUMBER}" --body-file "${COMMENT_FILE}" 2>/dev/null \
+                || echo "::warning::Could not post PR comment"
+            fi
+            echo "::endgroup::"
+          fi
+
+          # ── Step 6: Exit with the verdict ──────────────────────────
+          if [ "${GATE_STATUS}" = "failed" ]; then
+            printf '\033[31m\033[1m[gate]\033[0m Security gate \033[31mFAILED\033[0m — deploy blocked\n'
+            if [ -n "${GATE_REASON}" ]; then
+              printf '\033[31m[gate]\033[0m %s\n' "${GATE_REASON}"
+            fi
+            exit 1
+          elif [ "${GATE_STATUS}" = "pending" ]; then
+            printf '\033[33m\033[1m[gate]\033[0m Security gate \033[33mTIMEOUT\033[0m — scans did not finish in %s polls (increase VANALYZE_MAX_ATTEMPTS)\n' "${VANALYZE_MAX_ATTEMPTS}"
+            exit 1
+          elif [ "${GATE_STATUS}" = "passed" ]; then
+            printf '\033[32m\033[1m[gate]\033[0m Security gate \033[32mPASSED\033[0m\n'
+            exit 0
+          else
+            printf '\033[31m\033[1m[gate]\033[0m Unknown gate status: %s\n' "${GATE_STATUS}"
+            exit 1
+          fi
