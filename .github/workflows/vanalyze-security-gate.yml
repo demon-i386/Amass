@@ -25,7 +25,10 @@
 #   VANALYZE_API_KEY - API key from vanalyze (Settings > API Keys)
 #
 # Optional repo/organization variables:
-#   VANALYZE_API_URL      - Base URL (default: https://api-prod-v1.vanalyze.io)
+#   BASE_API             - Base URL (default: https://api-prod-v1.vanalyze.io).
+#                          A instalacao do gate (Pipeline > Security Gate) grava
+#                          esta variable no repositorio.
+#   VANALYZE_API_URL     - Nome anterior da mesma variable (aceito como fallback)
 #   VANALYZE_SCAN_TYPES  - Comma-separated checks (default: sast,sca,secrets,dependencies)
 #                           TIP: "full" runs every check in one pass
 #   VANALYZE_POLL_INTERVAL - Seconds between gate-check polls (default: 10)
@@ -64,7 +67,7 @@ jobs:
       - name: Run vanalyze Security Gate
         env:
           VANALYZE_API_KEY: ${{ secrets.VANALYZE_API_KEY }}
-          VANALYZE_API_URL: ${{ vars.VANALYZE_API_URL || 'https://api-prod-v1.vanalyze.io' }}
+          VANALYZE_API_URL: ${{ vars.BASE_API || vars.VANALYZE_API_URL || 'https://api-prod-v1.vanalyze.io' }}
           VANALYZE_SCAN_TYPES: ${{ vars.VANALYZE_SCAN_TYPES || 'sast,sca,secrets,dependencies' }}
           VANALYZE_POLL_INTERVAL: ${{ vars.VANALYZE_POLL_INTERVAL || '10' }}
           VANALYZE_MAX_ATTEMPTS: ${{ vars.VANALYZE_MAX_ATTEMPTS || '90' }}
