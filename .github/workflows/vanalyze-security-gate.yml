@@ -79,6 +79,9 @@ jobs:
           API_URL="${VANALYZE_API_URL%/}"
           AUTH_HEADER="Authorization: Bearer ${VANALYZE_API_KEY}"
           CONTENT_TYPE="Content-Type: application/json"
+          # User-Agent de cliente de API: alguns proxies/WAFs tratam o default
+          # do curl como bot e devolvem desafio em vez de JSON.
+          VANALYZE_USER_AGENT="vanalyze-security-gate/1.0 (+https://vanalyze.io)"
 
           # ── Banner ─────────────────────────────────────────────────
           # The "V" in purple (35); the calligraphic "analyze" and rules in
@@ -113,10 +116,24 @@ jobs:
             local out="$1" endpoint="$2" body="$3"
             curl -s -o "${out}.body" -w "%{http_code}" \
               -X POST \
+              -A "${VANALYZE_USER_AGENT}" \
               -H "${AUTH_HEADER}" \
               -H "${CONTENT_TYPE}" \
+              -H "Accept: application/json" \
               -d "${body}" \
               "${API_URL}${endpoint}" || echo "000"
+          }
+
+          # A API fica atras do Cloudflare: o desafio de bot ("Just a moment...")
+          # derruba a chamada da CI com 403 e um HTML, que nao diz nada ao
+          # operador. Traduzimos isso numa instrucao acionavel.
+          cf_guard() {
+            # cf_guard <body-file> <contexto>
+            if grep -qiE 'just a moment|cf-chl|cloudflare|__cf_chl' "$1" 2>/dev/null; then
+              fail "Cloudflare bloqueou a chamada da CI ($2): desafio de bot (HTTP 403, 'Just a moment...'). \
+          Libere o caminho /api/vanalyze/scans/* para os runners no Cloudflare (Security > WAF > Skip) \
+          ou aponte a variavel VANALYZE_API_URL para um host sem challenge."
+            fi
           }
 
           fail() { printf '\033[31m\033[1m[FAIL]\033[0m %s\n' "$1"; exit 1; }
@@ -131,6 +148,7 @@ jobs:
           LOOKUP_CODE=$(api_post /tmp/lookup "/api/vanalyze/scans/gate-repo-lookup" "{\"repo\": \"${GITHUB_REPOSITORY}\"}")
 
           if [ "${LOOKUP_CODE}" != "200" ]; then
+            cf_guard /tmp/lookup.body "gate-repo-lookup"
             fail "Repository lookup failed (HTTP ${LOOKUP_CODE}): $(cat /tmp/lookup.body 2>/dev/null | head -c 300)"
           fi
           mv /tmp/lookup.body /tmp/lookup.json
@@ -173,6 +191,7 @@ jobs:
           TRIGGER_CODE=$(api_post /tmp/trigger "/api/vanalyze/scans/trigger" "${TRIGGER_PAYLOAD}")
 
           if [ "${TRIGGER_CODE}" != "200" ]; then
+            cf_guard /tmp/trigger.body "scans/trigger"
             fail "Scan trigger failed (HTTP ${TRIGGER_CODE}): $(cat /tmp/trigger.body 2>/dev/null | head -c 300)"
           fi
           mv /tmp/trigger.body /tmp/trigger.json
@@ -203,6 +222,7 @@ jobs:
                   # 401/403/404 nao melhoram com espera: chave invalida, sem
                   # permissao no repositorio ou scan_id inexistente. Falha na
                   # hora, em vez de gastar 15 min de poll.
+                  cf_guard /tmp/gate.body "scans/gate-check"
                   fail "gate-check recusou a requisicao (HTTP ${GATE_CODE}): $(cat /tmp/gate.body 2>/dev/null | head -c 300)"
                   ;;
               esac
