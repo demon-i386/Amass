@@ -298,6 +298,18 @@ jobs:
               print(f"{G}       · {extra}{E}")
           for extra in (data.get("skipped_branches") or []):
               print(f"{G}       · branch fora do escopo do gate: {extra}{E}")
+
+          # QUAIS falhas bloquearam: só o título (+ severidade e repetições),
+          # sem stack/snippet — o detalhe técnico fica na plataforma.
+          blocked_findings = data.get("blocking_findings") or []
+          if blocked_findings:
+              print(f"\n{B}     Falhas que bloquearam{E}")
+              for b in blocked_findings:
+                  sev = str(b.get("severity") or "?").upper()
+                  sev_color = {"CRITICAL": R, "HIGH": Y}.get(sev, G)
+                  times = b.get("count") or 1
+                  suffix = f" ({times}x)" if times > 1 else ""
+                  print(f"       [{sev_color}{sev:>8}{E}] {b.get('title', '')}{G}{suffix}{E}")
           print(f"{G}    ────────────────────────────────────────────────────────────{E}")
 
           c, h = summary.get("critical", 0), summary.get("high", 0)
@@ -354,6 +366,15 @@ jobs:
               lines.append(f"> - {extra}")
           for extra in (data.get("skipped_branches") or []):
               lines.append(f"> - branch fora do escopo do gate: `{extra}`")
+
+          blocked_findings = data.get("blocking_findings") or []
+          if blocked_findings:
+              lines.append("")
+              lines.append("### Falhas que bloquearam")
+              for b in blocked_findings:
+                  times = b.get("count") or 1
+                  suffix = f" ({times}x)" if times > 1 else ""
+                  lines.append(f"- **{b.get('severity', '?')}** — {b.get('title', '')}{suffix}")
           if failed:
               # A scan that did not complete is a BLOCK, never a green tick with
               # a small red cell in the table: there is no coverage for it.
